@@ -214,5 +214,15 @@ def scrape_dpor(search_query: str = "Smith", max_records: int = 10, output_csv: 
 
 
 if __name__ == "__main__":
-    query = sys.argv[1] if len(sys.argv) > 1 else "Smith"
+    # If passed as a command-line argument, use it; otherwise, ask the user interactively
+    if len(sys.argv) > 1:
+        query = sys.argv[1].strip()
+    else:
+        query = input("Enter a License Number, Business Name, or Individual Name to search: ").strip()
+
+    # Ensure the user didn't just press Enter on an empty input
+    while not query:
+        print("Search query cannot be empty.")
+        query = input("Please enter a License Number, Business Name, or Individual Name: ").strip()
+
     scrape_dpor(query)
