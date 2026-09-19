@@ -1,4 +1,5 @@
 import csv
+from datetime import datetime
 import re
 import sys
 import time
@@ -9,27 +10,87 @@ from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 
 
+def determine_status(raw_status: str, expiration_str: str) -> str:
+    """If a license expiration date is in the past, it is Expired unless explicitly Revoked/Suspended."""
+    # Preserve critical punitive statuses
+    if raw_status and any(k in raw_status.lower() for k in ["revoked", "suspended", "surrendered"]):
+        return raw_status.capitalize()
+
+    # Try parsing expiration date against today's date
+    if expiration_str and expiration_str != "N/A":
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y"):
+            try:
+                exp_date = datetime.strptime(expiration_str.strip(), fmt).date()
+                today = datetime.now().date()
+                if exp_date < today:
+                    return "Expired"
+                else:
+                    return "Active"
+            except ValueError:
+                continue
+
+    # Default fallback to whatever was scraped or Active
+    return raw_status.capitalize() if raw_status and raw_status != "Unknown" else "Active"
+
+
+def extract_field_from_detail(driver, label_name: str) -> str:
+    """Extracts a cell value based on label from DPOR's detail table."""
+    xpath_queries = [
+        f"//tr[td[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{label_name.lower()}')]]/td[last()]",
+        f"//tr[th[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{label_name.lower()}')]]/td[1]",
+        f"//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{label_name.lower()}')]/following-sibling::td[1]",
+        f"//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{label_name.lower()}')]/following::td[1]"
+    ]
+    for xpath in xpath_queries:
+        try:
+            elements = driver.find_elements(By.XPATH, xpath)
+            for el in elements:
+                val = el.text.strip()
+                if val and label_name.lower() not in val.lower():
+                    return val
+        except Exception:
+            continue
+    return ""
+
+
 def parse_details_from_page(driver):
+    """Pulls raw status and expiration date, then evaluates expiration logic."""
+    raw_status = extract_field_from_detail(driver, "Status")
+    expiration = extract_field_from_detail(driver, "Expiration Date")
+    if not expiration:
+        expiration = extract_field_from_detail(driver, "Expiration")
+
+    # Body text regex fallback
     body_text = driver.find_element(By.TAG_NAME, "body").text
-    
-    # Quick regex match for Status
-    status_match = re.search(r'(?:License\s+Status|Status)\s*[:\-]?\s*([A-Za-z]+)', body_text, re.IGNORECASE)
-    status = status_match.group(1).strip() if status_match else ("Active" if "active" in body_text.lower() else "Expired")
 
-    # Quick regex match for Expiration Date
-    date_match = re.search(r'(?:Expiration|Expires|Exp\s*Date)\s*[:\-]?\s*(\d{1,2}/\d{1,2}/\d{4})', body_text, re.IGNORECASE)
-    expiration = date_match.group(1).strip() if date_match else "N/A"
+    if not raw_status:
+        m_status = re.search(r'(?:License\s+Status|Status)\s*[:\-]?\s*([A-Za-z]+)', body_text, re.IGNORECASE)
+        if m_status:
+            raw_status = m_status.group(1).strip()
+        elif "revoked" in body_text.lower():
+            raw_status = "Revoked"
+        elif "suspended" in body_text.lower():
+            raw_status = "Suspended"
 
-    return status, expiration
+    if not expiration:
+        # Match YYYY-MM-DD or MM/DD/YYYY
+        m_date = re.search(r'(?:Expiration(?:\s*Date)?|Expires)\s*[:\-]?\s*(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4})', body_text, re.IGNORECASE)
+        if m_date:
+            expiration = m_date.group(1).strip()
+
+    final_expiration = expiration or "N/A"
+    # Auto-evaluate: past expiration date = Expired
+    final_status = determine_status(raw_status, final_expiration)
+
+    return final_status, final_expiration
 
 
 def scrape_dpor(search_query: str = "Smith", max_records: int = 10, output_csv: str = "dpor_licenses.csv"):
     options = webdriver.ChromeOptions()
-    # RUN HEADLESS: Everything happens in memory without opening/re-rendering screens
-    options.add_argument("--headless=new")
+    # options.add_argument("--headless=new")
+    options.add_argument("--start-maximized")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
     options.add_argument("--disable-blink-features=AutomationControlled")
 
     driver = webdriver.Chrome(
@@ -39,28 +100,31 @@ def scrape_dpor(search_query: str = "Smith", max_records: int = 10, output_csv: 
 
     try:
         url = "https://dporweb.dpor.virginia.gov/LicenseLookup/"
-        print(f"Connecting to {url} (running silently in background)...")
+        print(f"Loading {url}...")
         driver.get(url)
+        time.sleep(3)
 
-        # Dismiss modal if present
+        # 1. Close modal popup if present
         for btn in driver.find_elements(By.XPATH, "//button[contains(text(), 'Close') or contains(text(), '×')]"):
             if btn.is_displayed():
                 driver.execute_script("arguments[0].click();", btn)
+                time.sleep(1)
 
-        # Perform Search
-        print(f"Searching for '{search_query}'...")
-        inputs = driver.find_elements(By.XPATH, "//input[@type='text' or not(@type)]")
-        for inp in inputs:
-            if inp.is_displayed() and inp.is_enabled():
-                inp.clear()
-                inp.send_keys(search_query)
-                inp.send_keys(Keys.RETURN)
-                time.sleep(3)
-                break
+        # 2. Enter search query
+        if search_query:
+            print(f"Searching for '{search_query}'...")
+            inputs = driver.find_elements(By.XPATH, "//input[@type='text' or not(@type)]")
+            for inp in inputs:
+                if inp.is_displayed() and inp.is_enabled():
+                    inp.clear()
+                    inp.send_keys(search_query)
+                    inp.send_keys(Keys.RETURN)
+                    time.sleep(4)
+                    break
 
-        # Grab all rows from the initial search table
+        # 3. Read initial results
         rows = driver.find_elements(By.XPATH, "//table//tr[count(./td) >= 4]")
-        summary_records = []
+        items = []
 
         for row in rows:
             cells = row.find_elements(By.XPATH, "./td")
@@ -70,40 +134,66 @@ def scrape_dpor(search_query: str = "Smith", max_records: int = 10, output_csv: 
             if not lic_num or not lic_num.isdigit():
                 continue
 
-            summary_records.append({
+            name = cells[1].text.strip() if len(cells) > 1 else ""
+            lic_type = cells[3].text.strip() if len(cells) > 3 else ""
+
+            items.append({
                 "license_num": lic_num,
-                "name": cells[1].text.strip() if len(cells) > 1 else "",
-                "license_type": cells[3].text.strip() if len(cells) > 3 else ""
+                "name": name,
+                "license_type": lic_type
             })
 
-        print(f"Found {len(summary_records)} results. Extracting complete records...")
+        print(f"Found {len(items)} licenses. Fetching details for up to {max_records} items...")
 
-        full_records = []
-        for i, item in enumerate(summary_records[:max_records]):
+        records = []
+
+        # 4. Lookup each record in a new tab
+        for i, item in enumerate(items[:max_records]):
             lic_num = item["license_num"]
-            # Look up the license directly
-            driver.get(f"https://dporweb.dpor.virginia.gov/LicenseLookup/")
-            
-            # Direct quick search
-            for inp in driver.find_elements(By.XPATH, "//input[@type='text' or not(@type)]"):
-                if inp.is_displayed():
-                    inp.send_keys(lic_num)
-                    inp.send_keys(Keys.RETURN)
-                    break
-            time.sleep(1)
+            print(f"[{i+1}/{min(len(items), max_records)}] Fetching #{lic_num} ({item['name']})...")
 
-            status, exp_date = parse_details_from_page(driver)
-            record = {
-                "License Holder Name": item["name"],
-                "License Number": lic_num,
-                "License Type / Trade": item["license_type"],
-                "License Status": status,
-                "Expiration Date": exp_date
-            }
-            print(f"[{i+1}/{min(len(summary_records), max_records)}] {record['License Number']} | {record['License Holder Name']} | {status} | {exp_date}")
-            full_records.append(record)
+            driver.switch_to.new_window('tab')
+            try:
+                driver.get("https://dporweb.dpor.virginia.gov/LicenseLookup/")
+                time.sleep(2)
 
-        if full_records:
+                # Close modal if present
+                for btn in driver.find_elements(By.XPATH, "//button[contains(text(), 'Close') or contains(text(), '×')]"):
+                    if btn.is_displayed():
+                        driver.execute_script("arguments[0].click();", btn)
+
+                # Search specifically for this license
+                inputs = driver.find_elements(By.XPATH, "//input[@type='text' or not(@type)]")
+                for inp in inputs:
+                    if inp.is_displayed() and inp.is_enabled():
+                        inp.clear()
+                        inp.send_keys(lic_num)
+                        inp.send_keys(Keys.RETURN)
+                        time.sleep(3)
+                        break
+
+                # Extract status & expiration date
+                status, expiration = parse_details_from_page(driver)
+
+                record = {
+                    "License Holder Name": item["name"],
+                    "License Number": lic_num,
+                    "License Type / Trade": item["license_type"],
+                    "License Status": status,
+                    "Expiration Date": expiration
+                }
+                print(f"   -> Status: {status} | Expiration: {expiration}")
+                records.append(record)
+
+            except Exception as err:
+                print(f"  Error on #{lic_num}: {err}")
+            finally:
+                driver.close()
+                driver.switch_to.window(driver.window_handles[0])
+                time.sleep(1)
+
+        # 5. Export to CSV
+        if records:
             fieldnames = [
                 "License Holder Name",
                 "License Number",
@@ -114,10 +204,10 @@ def scrape_dpor(search_query: str = "Smith", max_records: int = 10, output_csv: 
             with open(output_csv, mode="w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
-                writer.writerows(full_records)
-            print(f"\nDone! Saved {len(full_records)} records directly into '{output_csv}'.")
+                writer.writerows(records)
+            print(f"\nSaved all {len(records)} records to '{output_csv}'!")
 
-        return full_records
+        return records
 
     finally:
         driver.quit()
